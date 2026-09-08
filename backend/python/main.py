@@ -1,7 +1,8 @@
 import os
 import sys
-import sqlite3
-from fastapi import FastAPI, status, HTTPException, Security, Depends
+import requests
+from datetime import datetime
+from fastapi import FastAPI, status, HTTPException, Security, Depends, BackgroundTasks
 from fastapi.security.api_key import APIKeyHeader
 
 # Importy do Surprise i analizy danych
@@ -33,189 +34,158 @@ async def verify_api_key(header_value: str = Security(api_key_header)):
         detail="Brak lub niepoprawny klucz API (X-API-Key)"
     )
 
-# --- MODELE REKOMENDACJI SURPRISE ---
+# --- KLASA DO MODELI REKOMENDACJI ---
 
 class RecommendationModelManager:
     """Menedżer modeli rekomendacji z Surprise"""
     
     def __init__(self):
-        self.cf_model = None  # Collaborative Filtering (SVD)
-        self.cb_model = None  # Content-Based Filtering (KNNBasic)
-        self.dataset = None
-        self.trainset = None
-        self.testset = None
-    
-    def load_user_data_from_cloudflare_db(self, user_id: int):
-        """Ładuje dane użytkownika z bazy Cloudflare D1"""
-        try:
-            # Zapytanie do bazy Cloudflare - pobieramy rating i watched movies użytkownika
-            query = f"""
-                SELECT r.rating, w.movie_id
-                FROM reviews r
-                JOIN watched w ON r.user_id = w.user_id 
-                WHERE r.user_id = {user_id}
-                LIMIT 1000
-            """
-            
-            # Tutaj należy wstawić kod do pobrania danych z bazy Cloudflare D1
-            # Na przykład: db_connection.execute(query).fetchall()
-            # Poniżej są przykładowe dane - podmień na prawdziwe!
-            data = [(user_id, 4.5), (user_id, 3.8), (user_id, 4.2)]  
-            
-            return pd.DataFrame(data, columns=['rating', 'movie_id'])
-            
-        except Exception as e:
-            print(f"✗ Błąd podczas ładowania danych użytkownika z Cloudflare: {e}")
-            return None
-    
-    def load_movies_from_local_db(self):
-        """Ładuje wszystkie filmy z lokalnej bazy movies.db"""
-        try:
-            import sqlite3
-            conn = sqlite3.connect('movies.db')  # lub inny ścieżek do pliku movies.db
-            
-            query = """
-                SELECT id, title, genre, description, 
-                       COALESCE(vote_average, 0) as rating
-                FROM movies
-                LIMIT 500
-            """
-            
-            df = pd.read_sql_query(query, conn)
-            conn.close()
-            
-            print(f"✓ Załadowano {len(df)} filmów z movies.db")
-            return df
-            
-        except Exception as e:
-            print(f"✗ Błąd podczas ładowania filmów z movies.db: {e}")
-            return None
-    
-    def prepare_surprise_dataset(self, user_ratings_df):
-        """Przygotowuje zestaw danych w formacie Surprise"""
-        try:
-            # TworzyReader z skalą oceny 1-5
-            reader = Reader(rating_scale=(0.5, 5))  # Surprise używa skali 0.5-5
-            
-            # Tworzy dataset z ratingów użytkowników
-            self.dataset = Dataset.from_df(
-                user_ratings_df,
-                id_columns=['movie_id'],
-                rcolumns=['rating']
-            )
-            
-            print(f"✓ Przygotowano dataset: {len(self.dataset)} ocen")
-            
-        except Exception as e:
-            print(f"✗ Błąd podczas przygotowania dataset: {e}")
-    
+        self.cf_model = None  # Collaborative Filtering model
+        self.cb_model = None  # Content-Based Filtering model
+        # Cache w pamięci (szkielet) - klucz: "recommendations_{user_id}"
+        self._cache: dict = {}
+
     def build_collaborative_filtering_model(self, trainset):
-        """Buduje model Collaborative Filtering (SVD)"""
+        """Buduje model collaborative filtering (KNNBasic + SVD)"""
         try:
-            # SVD - Singular Value Decomposition dla collaborative filtering
-            self.cf_model = SVD(
-                n_factors=50,          # Liczba czynników (komponentów)
-                n_epochs=20,           # Liczba iteracji treningowych
-                random_state=42,       # Dla reproducibility
-                verbose=True           # Włączaj logowanie postępu
+            knn = KNNBasic(
+                min_k=20,
+                n_factors=50,
+                n_epochs=20,
+                random_state=42
             )
-            
-            # Trenujemy model
-            self.cf_model.fit(trainset)
-            print(f"✓ Model Collaborative Filtering (SVD) gotowy!")
-            
+            knn.fit(trainset)
+            self.cf_model = knn
+            print("Model collaborative filtering wybudowany")
         except Exception as e:
-            print(f"✗ Błąd budowania CF modelu: {e}")
+            print(f"Błąd podczas budowania modelu CF: {e}")
     
     def build_content_based_filtering_model(self, trainset):
-        """Buduje model Content-Based Filtering (KNNBasic)"""
+        """Buduje model content-based (SVD)"""
         try:
-            # KNN - k-Nearest Neighbors dla content-based filtering
-            self.cb_model = KNNBasic(
-                mem_map=True,          # Używaj mapowania pamięci dla dużych datasetów
-                ns_neighbors=20,       # Liczba sąsiadów do uwzględnienia
-                user_based=True,        # Opiera się na użytkownikach (zamiast filmów)
-                verbose=True           # Włączaj logowanie postępu
+            svd = SVD(
+                n_factors=50,
+                n_epochs=20,
+                random_state=42
             )
-            
-            # Trenujemy model
-            self.cb_model.fit(trainset)
-            print(f"✓ Model Content-Based Filtering (KNNBasic) gotowy!")
-            
+            svd.fit(trainset)
+            self.cb_model = svd
+            print("Model content-based wybudowany")
         except Exception as e:
-            print(f"✗ Błąd budowania CB modelu: {e}")
-    
-    def split_data(self, dataset):
-        """Podzieli dane na zestaw treningowy i testowy"""
-        try:
-            self.trainset, self.testset = train_test_split(
-                dataset, 
-                test_size=0.25,       # 25% do testów
-                allow_same_user=True   # Pozwala na ten samego użytkownika w training/test
-            )
-            print(f"✓ Dane podzielone: {len(self.trainset)} treningowych, {len(self.testset)} testowych")
-        except Exception as e:
-            print(f"✗ Błąd podczas podziału danych: {e}")
-    
-    def predict_single(self, user_id, movie_id):
-        """Przeprowadź pojedynczą predykcję"""
-        if self.cf_model and user_id in self.cf_model.get_all_users():
-            try:
-                prediction = self.cf_model.predict(user_id, movie_id)
-                return {
-                    "estimation": prediction.estimation,
-                    "confidence_interval": list(prediction.confidence_interval),
-                    "error_bound": prediction.error_bound
-                }
-            except Exception as e:
-                print(f"Predict error: {e}")
-        return None
-    
-    def get_recommendations_for_user(self, user_id, n=10):
-        """Zwróć TOP-N rekomendacji dla użytkownika"""
-        try:
-            # Sprawdzamy czy użytkownik jest w modelu
-            if not self.cf_model or user_id not in self.cf_model.get_all_users():
-                return []
-            
-            predictions = []
-            watched_movies = set()
-            
-            # Pobierzmy liste wszystkich użytkowników i filmów z modelu
-            all_users = list(self.cf_model.get_all_users())
-            
-            for movie_id, rating_data in self.cf_model.similar_items(user_id):
-                try:
-                    prediction = self.cf_model.predict(user_id, movie_id)
-                    
-                    # Sprawdź czy użytkownik nie ocenił już tego filmu
-                    if user_id not in rating_data or str(rating_data[user_id]) != "nan":
-                        predictions.append({
-                            "movie_id": movie_id,
-                            "rating": prediction.estimation,
-                            "confidence_interval": list(prediction.confidence_interval)
-                        })
-                except:
-                    continue
-            
-            # Sortuj według przewidywanych ocen (najwyższe pierwsze)
-            predictions.sort(key=lambda x: x["rating"], reverse=True)
-            
-            return predictions[:n]
-            
-        except Exception as e:
-            print(f"✗ Błąd podczas generowania rekomendacji: {e}")
-            return []
+            print(f"Błąd podczas budowania modelu CB: {e}")
 
-# Globalny menedżer modeli
+    # --- CACHE TYMCZASOWY (DO ZMIANY!!!) ---
+    #
+    # UWAGA: poniższe metody są TYLKO szkieletem (placeholder).
+    # Backend nie ma jeszcze gotowej tabeli do zapisu rekomendacji (frontend
+    # nie jest jeszcze po stronie gotowy). Zamiast pisać do bazy, cache jest
+    # przechowywany tymczasowo w pamięci RAM (dict) z prostym expires-at.
+    #
+    # GDD: gdyby istniał endpoint do zapisu, miałby być albo pusty, albo zakomentowany.
+    # Tutaj zapis w ogóle nie jest wywoływany (zob. endpoint get_recommendations).
+
+    def get_cached_recommendation(self, cache_key):
+        """SZKIELET odczytu z cache (pamięć RAM). Zwraca listę lub None."""
+        if cache_key not in self._cache:
+            return None
+        entry = self._cache[cache_key]
+        if entry is None:
+            return None
+        # proste wygaszanie (szkielet)
+        expires_at = entry.get("expires_at")
+        if expires_at is not None and datetime.now().timestamp() > expires_at:
+            self._cache[cache_key] = None
+            return None
+        return entry.get("recommendations") if entry else None
+
+    def save_cached_recommendation(self, user_id, recommendations, cache_key):
+        """SZKIELET zapisu do cache (pamięć RAM).
+        NIE zapisuje jeszcze do bazy (brak gotowej tabeli po stronie frontendu).
+        """
+        expires_at = datetime.now().timestamp() + CACHE_EXPIRATION_MINUTES * 60
+        self._cache[cache_key] = {
+            "user_id": user_id,
+            "recommendations": recommendations,
+            "expires_at": expires_at,
+        }
+
+# --- KLASA DO POŁĄCZENIA Z CLOUDFLARE D1 ---
+
+class CloudflareDBConnection:
+    """Klasa do interfejsu z bazą danych w Cloudflare D1"""
+
+    def __init__(self):
+        self.account_id = os.getenv("ACCOUNT_ID")
+        self.database_id = os.getenv("DATABASE_ID")
+        self.api_token = os.getenv("API_TOKEN")
+        
+        # Budujemy URL do REST API Cloudflare
+        self.endpoint_url = "https://api.cloudflare.com/client/v4/accounts"
+
+    def fetch_user_ratings(self, user_id: int) -> pd.DataFrame | None:
+        """
+        Pobieramy oceny użytkownika z bazy Cloudflare D1.
+        RETURN: DataFrame z kolumnami (rating, movie_id) lub None w razie błędu
+        """
+        try:
+            if not self.account_id or not self.database_id or not self.api_token:
+                print("Brak połączenia z Cloudflare - brak kluczy środowiskowych")
+                return None
+            
+            # Budujemy URL do REST API
+            endpoint = f"{self.endpoint_url}/{self.account_id}/databases/{self.database_id}/query"
+            
+            # Zapytanie SQL - pobieramy rating i movie_id z reviews dla użytkownika
+            query = """
+                SELECT r.rating, r.movie_id
+                FROM reviews r
+                WHERE r.user_id = ?
+                ORDER BY r.created_at DESC
+                LIMIT 100
+            """
+            
+            # Parametr SQL (bez iniekcji!)
+            headers = {
+                "Authorization": f"Bearer {self.api_token}",
+                "Content-Type": "application/json"
+            }
+            
+            payload = {"query": query}
+            
+            response = requests.post(endpoint, json=payload, headers=headers)
+            
+            if response.status_code == 200:
+                data = response.json().get("result", [])
+                
+                # Konwertujemy JSON do DataFrame z rating i movie_id
+                return pd.DataFrame(data, columns=["rating", "movie_id"])
+            else:
+                print(f"Błąd API Cloudflare (status: {response.status_code})")
+                return None
+                
+        except Exception as e:
+            print(f"Błąd podczas pobierania danych użytkownika z Cloudflare: {e}")
+            return None
+
+# Inicjalizacja menedżera modeli i bazy Cloudflare
 model_manager = RecommendationModelManager()
+cloudflare_db = CloudflareDBConnection()
+
+# Endpoint publiczny (np. dla Cloudflare do sprawdzania czy kontener żywe)
+@app.get("/health")
+async def health_check():
+    return {"status": "healthy"}
+
+CACHE_EXPIRATION_MINUTES = 30
+
+
 
 @app.get("/movies/recommendations", dependencies=[Depends(verify_api_key)])
 async def get_recommendations(user_id: int):
     """Endpoint rekomendacji filmów z Surprise (Content-Based + Collaborative Filtering)"""
     
     # 1. Ładujemy dane użytkownika z Cloudflare D1
-    user_ratings_df = model_manager.load_user_data_from_cloudflare_db(user_id)
+    user_ratings_df = cloudflare_db.fetch_user_ratings(user_id)
     
     if user_ratings_df is None:
         return {
@@ -223,52 +193,173 @@ async def get_recommendations(user_id: int):
             "message": "Nie można pobrać danych użytkownika z bazy Cloudflare"
         }
     
-    # 2. Ładujemy filmy z lokalnej bazy movies.db (tylko jeśli dataset nie istnieje)
-    if model_manager.dataset is None:
-        movies_df = model_manager.load_movies_from_local_db()
+    # 2. Przygotujemy Surprise dataset i trenujmy modele
+    dataset = Dataset.from_df(
+        user_ratings_df,
+        id_columns=['movie_id'],
+        rcolumns=['rating']
+    )
+    
+    try:
+        # Podziel dane na trening/test
+        trainset, testset = train_test_split(
+            dataset, 
+            test_size=0.25,       # 25% do testów
+            allow_same_user=True   # Pozwala na tego samego użytkownika w training/test
+        )
         
-        if movies_df is None:
-            return {
-                "status": "error", 
-                "message": "Nie można pobrać danych filmów z movies.db"
-            }
-    
-    # 3. Przygotujemy Surprise dataset
-    model_manager.prepare_surprise_dataset(user_ratings_df)
-    
-    # 4. Trenuj oba modele (tylko jeśli jeszcze nie są trenowane)
-    if model_manager.dataset:
-        try:
-            # Podziel dane na trening/test (tylko jeśli potrzeba)
-            model_manager.split_data(model_manager.dataset)
+        # Budujmy modele (tylko jeśli jeszcze nie istnieją)
+        if not model_manager.cf_model:
+            model_manager.build_collaborative_filtering_model(trainset)
+        if not model_manager.cb_model:
+            model_manager.build_content_based_filtering_model(trainset)
             
-            # Budujemy modele (tylko jeśli jeszcze nie istnieją)
-            if not model_manager.cf_model:
-                model_manager.build_collaborative_filtering_model(model_manager.trainset)
-            if not model_manager.cb_model:
-                model_manager.build_content_based_filtering_model(model_manager.trainset)
-                
-        except Exception as e:
-            print(f"✗ Błąd podczas trenowania modeli: {e}")
+    except Exception as e:
+        print(f"Błąd podczas trenowania modeli: {e}")
     
-    # 5. Generujemy rekomendacje
-    recommendations = model_manager.get_recommendations_for_user(user_id, n=10)
+    # 3. Generujemy rekomendacje SVD
+    recommendations = []
+    if model_manager.cf_model and user_id in model_manager.cf_model.get_all_users():
+        try:
+            # Pobierzmy podobne filmy dla użytkownika
+            similar_items = model_manager.cf_model.similar_items(user_id)
+            
+            for movie_id, data in similar_items:
+                try:
+                    prediction = model_manager.cf_model.predict(user_id, movie_id)
+                    
+                    # Sprawdź czy użytkownik nie ocenił już tego filmu
+                    if user_id not in data or str(data[user_id]) != "nan":
+                        recommendations.append({
+                            "movie_id": movie_id,
+                            "rating": round(prediction.estimation, 2),
+                            "confidence_interval": list(prediction.confidence_interval)
+                        })
+                except:
+                    continue
+            
+            # Sortuj według przewidywanych ocen (najwyższe pierwsze)
+            recommendations.sort(key=lambda x: x["rating"], reverse=True)
+            
+        except Exception as e:
+            print(f"✗ Błąd podczas generowania rekomendacji: {e}")
+    
+    # 4. Zwróćmy wyniki z cache jeśli aktualne
+    cache_key = f"recommendations_{user_id}"
+    cached_recommendations = model_manager.get_cached_recommendation(cache_key)
+    
+    if cached_recommendations and len(cached_recommendations) > 0:
+        return {
+            "status": "success",
+            "source": "cache",
+            "user_id": user_id,
+            "type": "collaborative_filtering",
+            "count": len(cached_recommendations),
+            "recommendations": cached_recommendations
+        }
+    
+    # 5. Zapiszmy cache jeśli mamy rekomendacje
+    if recommendations:
+        model_manager.save_cached_recommendation(
+            user_id=user_id, 
+            recommendations=recommendations[:10],
+            cache_key=cache_key
+        )
     
     return {
+        "status": "success",
+        "source": "computed",
         "user_id": user_id,
-        "type": "collaborative_filtering",  # SVD model
+        "type": "collaborative_filtering",
         "count": len(recommendations),
-        "recommendations": [
-            {
-                "movie_id": rec["movie_id"],
-                "prediction": round(rec["rating"], 2),
-                "confidence_interval": rec["confidence_interval"]
-            }
-            for rec in recommendations
-        ]
+        "recommendations": recommendations[:10]  # Zwróćmy max 10 rekomendacji
     }
 
-# Endpoint publiczny (np. dla Cloudflare do sprawdzania czy kontener żywe)
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+
+@app.get("/movies/recommendations/force-recalculate")
+async def force_recommendation_calculation(user_id: int):
+    """Endpoint do wymuszenia ponownego obliczania (bez cache)"""
+    
+    # 1. Ładujemy dane użytkownika z Cloudflare D1
+    user_ratings_df = cloudflare_db.fetch_user_ratings(user_id)
+    
+    if user_ratings_df is None:
+        return {
+            "status": "error",
+            "message": "Nie można pobrać danych użytkownika z bazy Cloudflare"
+        }
+    
+    # 2. Przygotujmy Surprise dataset
+    dataset = Dataset.from_df(
+        user_ratings_df,
+        id_columns=['movie_id'],
+        rcolumns=['rating']
+    )
+    
+    try:
+        # Podziel dane na trening/test
+        trainset, _ = train_test_split(
+            dataset, 
+            test_size=0.25,
+            allow_same_user=True
+        )
+        
+        # Trenujmy modele od nowa
+        model_manager.build_collaborative_filtering_model(trainset)
+        model_manager.build_content_based_filtering_model(trainset)
+        
+    except Exception as e:
+        print(f"✗ Błąd podczas trenowania modeli (force): {e}")
+        return {
+            "status": "error",
+            "message": f"Błąd podczas trenowania modeli: {e}"
+        }
+    
+    # 3. Generujemy rekomendacje bez cache
+    recommendations = []
+    if model_manager.cf_model and user_id in model_manager.cf_model.get_all_users():
+        try:
+            similar_items = model_manager.cf_model.similar_items(user_id)
+            
+            for movie_id, data in similar_items:
+                try:
+                    prediction = model_manager.cf_model.predict(user_id, movie_id)
+                    
+                    if user_id not in data or str(data[user_id]) != "nan":
+                        recommendations.append({
+                            "movie_id": movie_id,
+                            "rating": round(prediction.estimation, 2),
+                            "confidence_interval": list(prediction.confidence_interval)
+                        })
+                except:
+                    continue
+            
+            recommendations.sort(key=lambda x: x["rating"], reverse=True)
+            
+        except Exception as e:
+            print(f"✗ Błąd podczas generowania rekomendacji (force): {e}")
+    
+    # 4. Zwróćmy wyniki
+    return {
+        "status": "success",
+        "source": "forced-recalculation",
+        "user_id": user_id,
+        "type": "collaborative_filtering",
+        "count": len(recommendations),
+        "recommendations": recommendations[:10]
+    }
+
+
+# --- ENDPOINTY DO REKOMENDACJI DLA FRONTENDU ---
+
+@app.get("/movies/user/{user_id}/recommendations", dependencies=[Depends(verify_api_key)])
+async def get_user_recommendations(user_id: int):
+    """
+    Endpoint pobierania rekomendacji filmów dla użytkownika.
+    Zwraca JSON z listą rekomendowanych filmów.
+    Frontend woła ten endpoint, aby pokazać rekomendacje na dashboardzie.
+
+    Uwaga: to jest to samo logiczne zapytanie co /movies/recommendations,
+    tylko z innym pathem dla wygody frontendu.
+    """
+    return await get_recommendations(user_id)
