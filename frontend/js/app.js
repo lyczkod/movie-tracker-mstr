@@ -4605,18 +4605,6 @@ async triggerFastApiRecalculation() {
                     </div>
                 `;
             }).join('');
-
-            // Zaznacz filmy, które użytkownik już wybrał wcześniej
-            let savedIds = [];
-            try {
-                if (this.currentUser?.favorite_kaggle_ids) {
-                    savedIds = JSON.parse(this.currentUser.favorite_kaggle_ids) || [];
-                }
-            } catch { savedIds = []; }
-            savedIds.forEach(id => {
-                const card = grid.querySelector(`.favorites-movie-card[data-id="${id}"]`);
-                if (card) card.classList.add('selected');
-            });
             this._updateFavoritesCount();
         } catch (e) {
             console.error('Error loading favorites movies:', e);
@@ -4657,11 +4645,7 @@ async triggerFastApiRecalculation() {
         // Zachowuje ewentualne poprzednie wybory, nie wymaga zaznaczenia czegokolwiek.
         if (skip && this.currentUser && !this.currentUser.favorites_selected) {
             try {
-                let prevIds = [];
-                try {
-                    if (this.currentUser.favorite_kaggle_ids)
-                        prevIds = JSON.parse(this.currentUser.favorite_kaggle_ids) || [];
-                } catch { prevIds = []; }
+                const prevIds = [];
                 await fetch('/api/auth/favorites-setup', {
                     method: 'POST',
                     headers: this.getAuthHeaders(),
@@ -4679,25 +4663,9 @@ async triggerFastApiRecalculation() {
     async saveFavoriteMovies() {
         const grid = document.getElementById('favorites-movies-grid');
         const cards = grid ? grid.querySelectorAll('.favorites-movie-card.selected') : [];
-        const selectedInGrid = Array.from(cards).map(c => parseInt(c.dataset.id)).filter(Boolean);
+        const movieIds = Array.from(cards).map(c => parseInt(c.dataset.id)).filter(Boolean);
 
-        // Zbierz ID wszystkich kart w siatce (niekoniecznie zaznaczonych)
-        const allInGrid = grid
-            ? Array.from(grid.querySelectorAll('.favorites-movie-card')).map(c => parseInt(c.dataset.id)).filter(Boolean)
-            : [];
-
-        // Zachowaj poprzednio zapisane ID, które nie są widoczne w bieżącej siatce
-        let prevIds = [];
-        try {
-            if (this.currentUser?.favorite_kaggle_ids) {
-                prevIds = JSON.parse(this.currentUser.favorite_kaggle_ids) || [];
-            }
-        } catch { prevIds = []; }
-        const preservedIds = prevIds.filter(id => !allInGrid.includes(id));
-
-        const movieIds = [...preservedIds, ...selectedInGrid];
-
-        // Jeśli nic nie zaznaczono — traktuj jak pominięcie (nie blokuj użytkownika)
+        // Jeśli nic nie zaznaczono — traktuj jak pominięcie
         if (movieIds.length === 0) {
             await this.closeFavoritesModal(true);
             this.showNotification('Pominięto wybór — możesz wrócić do ulubionych w ustawieniach.', 'info');
@@ -4711,6 +4679,7 @@ async triggerFastApiRecalculation() {
         }
 
         try {
+            // 1. Zapis konfiguracji (dodaje wpisy do user_onboarding_movies)
             const res = await fetch('/api/auth/favorites-setup', {
                 method: 'POST',
                 headers: this.getAuthHeaders(),
@@ -4720,12 +4689,33 @@ async triggerFastApiRecalculation() {
             if (!res.ok) throw new Error('Błąd zapisu');
 
             this.currentUser.favorites_selected = 1;
-            this.currentUser.favorite_kaggle_ids = JSON.stringify(movieIds);
             this._updateFavoritesBanner();
-
+            
             await this.closeFavoritesModal(false);
+            this.showNotification('Ulubione filmy zostały zapisane do Twojego profilu algorytmu!', 'success');
 
-            this.showNotification('Ulubione filmy zostały zapisane!', 'success');
+            // 2. Zapytanie, czy wrzucić wybrane tytuły w statystyki obejrzanych
+            const addToWatched = await this.showConfirm(
+                'Czy chcesz dodać wybrane filmy od razu do swojej bazy danych jako "obejrzane"? Pozwoli Ci to widzieć je w profilu i na liście.',
+                'Szybkie uzupełnianie obejrzanych'
+            );
+            
+            if (addToWatched) {
+                try {
+                    await fetch('/api/auth/favorites-setup/confirm-watched', {
+                        method: 'POST',
+                        headers: this.getAuthHeaders(),
+                        body: JSON.stringify({ movieIds })
+                    });
+                    
+                    this.showNotification('Pomyślnie skopiowano filmy do obejrzanych!', 'success');
+                    await this.loadMoviesData();
+                } catch (e) {
+                    console.error('Błąd przenoszenia z onboardingu do obejrzanych:', e);
+                    this.showNotification('Wystąpił problem przy masowym dodawaniu do obejrzanych.', 'error');
+                }
+            }
+
         } catch (e) {
             console.error('Error saving favorites:', e);
             this.showNotification('Błąd podczas zapisywania. Spróbuj ponownie.', 'error');

@@ -49,25 +49,15 @@ export async function onRequestGet(context) {
   // Gwarantuje 30 wyników nawet przy małej liczbie gatunków
   const movies = await env.db.prepare(`
     WITH pool AS (
-      SELECT id, title, poster_url, media_type,
-             TRIM(CASE
-               WHEN INSTR(genre, ',') > 0 THEN SUBSTR(genre, 1, INSTR(genre, ',') - 1)
-               ELSE genre
-             END) AS primary_genre
+      SELECT id, title, poster_url, media_type
       FROM movies
       WHERE media_type = 'movie'
         AND poster_url IS NOT NULL AND poster_url != ''
-        AND genre IS NOT NULL AND genre != ''
       ORDER BY popularity DESC
-      LIMIT 300
-    ),
-    ranked AS (
-      SELECT *, ROW_NUMBER() OVER (PARTITION BY primary_genre ORDER BY RANDOM()) AS rn
-      FROM pool
+      LIMIT 150
     )
     SELECT id, title, poster_url, media_type
-    FROM ranked
-    WHERE rn <= 3
+    FROM pool
     ORDER BY RANDOM()
     LIMIT 30
   `).all();
@@ -93,9 +83,22 @@ export async function onRequestPost(context) {
     const movieIds = Array.isArray(body.movieIds) ? body.movieIds : [];
     const skipped = body.skipped === true;
 
-    await env.db.prepare(
-      'UPDATE users SET favorite_kaggle_ids = ?, favorites_selected = 1 WHERE id = ?'
-    ).bind(JSON.stringify(movieIds), userId).run();
+    // Przygotuj zapytania do wykonania w jednym batchu
+    const statements = [];
+    statements.push(
+      env.db.prepare('UPDATE users SET favorites_selected = 1 WHERE id = ?').bind(userId)
+    );
+
+    if (movieIds.length > 0) {
+      const insertStmt = env.db.prepare(
+        'INSERT OR IGNORE INTO user_onboarding_movies (user_id, movie_id) VALUES (?, ?)'
+      );
+      for (const movieId of movieIds) {
+        statements.push(insertStmt.bind(userId, movieId));
+      }
+    }
+
+    await env.db.batch(statements);
 
     return new Response(JSON.stringify({ success: true, skipped }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },

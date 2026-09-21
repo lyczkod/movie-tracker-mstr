@@ -43,6 +43,17 @@ class DatabaseManager:
             return [r["movie_id"] for r in rows] if rows else []
         return []
 
+    def fetch_onboarding_movies(self, user_id: int):
+        sql_query = "SELECT movie_id FROM user_onboarding_movies WHERE user_id = ?"
+        payload = {"sql": sql_query, "params": [user_id]}
+        
+        res = requests.post(self.endpoint, json=payload, headers=self.headers)
+        if res.status_code == 200:
+            data = res.json().get("result", [])
+            rows = data[0].get('results', []) if data and 'results' in data[0] else data
+            return [r["movie_id"] for r in rows] if rows else []
+        return []
+
     def get_cached_recommendations(self, user_id: int, rec_type: str):
         sql_query = "SELECT movie_id, predicted_rating, confidence_lower, confidence_upper FROM user_recommendations WHERE user_id = ? AND recommendation_type = ? AND expires_at > ? ORDER BY predicted_rating DESC"
         payload = {"sql": sql_query, "params": [user_id, rec_type, str(int(time.time()))]}
