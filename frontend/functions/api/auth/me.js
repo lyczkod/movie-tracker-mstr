@@ -18,8 +18,7 @@ export async function onRequestGet(context) {
       });
     }
 
-    // Kolumny favorites_selected i favorite_kaggle_ids istnieją w tabeli users
-    const user = await env.db.prepare('SELECT id, nickname, email, role, theme_preference, avatar_url, description, created_at, favorites_selected, favorite_kaggle_ids FROM users WHERE id = ?').bind(userId).first();
+    const user = await env.db.prepare('SELECT id, nickname, email, role, theme_preference, avatar_url, description, created_at, favorites_selected FROM users WHERE id = ?').bind(userId).first();
     if (!user) {
       return new Response(JSON.stringify({ error: 'User not found' }), {
         status: 404,
