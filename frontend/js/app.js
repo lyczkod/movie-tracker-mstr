@@ -4702,7 +4702,7 @@ async triggerFastApiRecalculation() {
             
             if (addToWatched) {
                 try {
-                    await fetch('/api/auth/favorites-setup/confirm-watched', {
+                    await fetch('/api/auth/confirm-watched', {
                         method: 'POST',
                         headers: this.getAuthHeaders(),
                         body: JSON.stringify({ movieIds })
